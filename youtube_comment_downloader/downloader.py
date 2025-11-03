@@ -3,7 +3,6 @@ from __future__ import print_function
 import json
 import re
 import time
-
 import dateparser
 import requests
 
@@ -21,7 +20,6 @@ YT_HIDDEN_INPUT_RE = r'<input\s+type="hidden"\s+name="([A-Za-z0-9_]+)"\s+value="
 
 
 class YoutubeCommentDownloader:
-
     def __init__(self):
         self.session = requests.Session()
         self.session.headers['User-Agent'] = USER_AGENT
@@ -29,7 +27,6 @@ class YoutubeCommentDownloader:
 
     def ajax_request(self, endpoint, ytcfg, retries=5, sleep=20, timeout=60):
         url = 'https://www.youtube.com' + endpoint['commandMetadata']['webCommandMetadata']['apiUrl']
-
         data = {'context': ytcfg['INNERTUBE_CONTEXT'],
                 'continuation': endpoint['continuationCommand']['token']}
 
@@ -51,7 +48,6 @@ class YoutubeCommentDownloader:
         response = self.session.get(youtube_url)
 
         if 'consent' in str(response.url):
-            # We may get redirected to a separate page for cookie consent. If this happens we agree automatically.
             params = dict(re.findall(YT_HIDDEN_INPUT_RE, response.text))
             params.update({'continue': youtube_url, 'set_eom': False, 'set_ytc': True, 'set_apyt': True})
             response = self.session.post(YOUTUBE_CONSENT_URL, params=params)
@@ -59,7 +55,7 @@ class YoutubeCommentDownloader:
         html = response.text
         ytcfg = json.loads(self.regex_search(html, YT_CFG_RE, default=''))
         if not ytcfg:
-            return  # Unable to extract configuration
+            return
         if language:
             ytcfg['INNERTUBE_CONTEXT']['client']['hl'] = language
 
@@ -68,15 +64,12 @@ class YoutubeCommentDownloader:
         item_section = next(self.search_dict(data, 'itemSectionRenderer'), None)
         renderer = next(self.search_dict(item_section, 'continuationItemRenderer'), None) if item_section else None
         if not renderer:
-            # Comments disabled?
             return
 
         sort_menu = next(self.search_dict(data, 'sortFilterSubMenuRenderer'), {}).get('subMenuItems', [])
         if not sort_menu:
-            # No sort menu. Maybe this is a request for community posts?
             section_list = next(self.search_dict(data, 'sectionListRenderer'), {})
             continuations = list(self.search_dict(section_list, 'continuationEndpoint'))
-            # Retry..
             data = self.ajax_request(continuations[0], ytcfg) if continuations else {}
             sort_menu = next(self.search_dict(data, 'sortFilterSubMenuRenderer'), {}).get('subMenuItems', [])
         if not sort_menu or sort_by >= len(sort_menu):
@@ -86,66 +79,81 @@ class YoutubeCommentDownloader:
         while continuations:
             continuation = continuations.pop()
             response = self.ajax_request(continuation, ytcfg)
-
             if not response:
                 break
 
-            error = next(self.search_dict(response, 'externalErrorMessage'), None)
-            if error:
-                raise RuntimeError('Error returned from server: ' + error)
-
             actions = list(self.search_dict(response, 'reloadContinuationItemsCommand')) + \
                       list(self.search_dict(response, 'appendContinuationItemsAction'))
+
             for action in actions:
                 for item in action.get('continuationItems', []):
                     if action['targetId'] in ['comments-section',
                                               'engagement-panel-comments-section',
                                               'shorts-engagement-panel-comments-section']:
-                        # Process continuations for comments and replies.
                         continuations[:0] = [ep for ep in self.search_dict(item, 'continuationEndpoint')]
-                    if action['targetId'].startswith('comment-replies-item') and 'continuationItemRenderer' in item:
-                        # Process the 'Show more replies' button
-                        continuations.append(next(self.search_dict(item, 'buttonRenderer'))['command'])
-
-            surface_payloads = self.search_dict(response, 'commentSurfaceEntityPayload')
-            payments = {payload['key']: next(self.search_dict(payload, 'simpleText'), '')
-                        for payload in surface_payloads if 'pdgCommentChip' in payload}
-            if payments:
-                # We need to map the payload keys to the comment IDs.
-                view_models = [vm['commentViewModel'] for vm in self.search_dict(response, 'commentViewModel')]
-                surface_keys = {vm['commentSurfaceKey']: vm['commentId']
-                                for vm in view_models if 'commentSurfaceKey' in vm}
-                payments = {surface_keys[key]: payment for key, payment in payments.items() if key in surface_keys}
 
             toolbar_payloads = self.search_dict(response, 'engagementToolbarStateEntityPayload')
             toolbar_states = {payload['key']: payload for payload in toolbar_payloads}
+
             for comment in reversed(list(self.search_dict(response, 'commentEntityPayload'))):
                 properties = comment['properties']
                 cid = properties['commentId']
                 author = comment['author']
                 toolbar = comment['toolbar']
-                toolbar_state = toolbar_states[properties['toolbarStateKey']]
-                result = {'cid': cid,
-                          'text': properties['content']['content'],
-                          'time': properties['publishedTime'],
-                          'author': author['displayName'],
-                          'channel': author['channelId'],
-                          'votes': toolbar['likeCountNotliked'].strip() or "0",
-                          'replies': toolbar['replyCount'],
-                          'photo': author['avatarThumbnailUrl'],
-                          'heart': toolbar_state.get('heartState', '') == 'TOOLBAR_HEART_STATE_HEARTED',
-                          'reply': '.' in cid}
+                toolbar_state = toolbar_states.get(properties['toolbarStateKey'], {})
+                result = {
+                    'cid': cid,
+                    'text': properties['content']['content'],
+                    'time': properties['publishedTime'],
+                    'author': author['displayName'],
+                    'channel': author['channelId'],
+                    'votes': toolbar['likeCountNotliked'].strip() or "0",
+                    'replies': [],
+                    'photo': author['avatarThumbnailUrl'],
+                    'heart': toolbar_state.get('heartState', '') == 'TOOLBAR_HEART_STATE_HEARTED',
+                    'reply': '.' in cid
+                }
 
                 try:
                     result['time_parsed'] = dateparser.parse(result['time'].split('(')[0].strip()).timestamp()
                 except AttributeError:
                     pass
 
-                if cid in payments:
-                    result['paid'] = payments[cid]
+                reply_count = int(toolbar.get('replyCount', 0) or 0)
+                if reply_count > 0:
+                    result['replies'] = list(self.get_replies(ytcfg, cid, sleep))
 
                 yield result
             time.sleep(sleep)
+
+    def get_replies(self, ytcfg, parent_cid, sleep=0.1):
+        continuation_token = f"Eg0SC{parent_cid}GAYyJSIRIgt9bG9naW4tY29tbWVudHM%3D"
+        url = f"https://www.youtube.com/youtubei/v1/next?key={ytcfg['INNERTUBE_API_KEY']}"
+        data = {"context": ytcfg['INNERTUBE_CONTEXT'], "continuation": continuation_token}
+
+        try:
+            r = self.session.post(url, json=data, timeout=30)
+            if r.status_code != 200:
+                return
+            json_data = r.json()
+
+            for comment in self.search_dict(json_data, 'commentEntityPayload'):
+                properties = comment['properties']
+                author = comment['author']
+                toolbar = comment['toolbar']
+                yield {
+                    'cid': properties['commentId'],
+                    'text': properties['content']['content'],
+                    'time': properties['publishedTime'],
+                    'author': author['displayName'],
+                    'channel': author['channelId'],
+                    'votes': toolbar['likeCountNotliked'].strip() or "0",
+                    'photo': author['avatarThumbnailUrl'],
+                    'reply': True
+                }
+        except Exception:
+            return
+        time.sleep(sleep)
 
     @staticmethod
     def regex_search(text, pattern, group=1, default=None):
